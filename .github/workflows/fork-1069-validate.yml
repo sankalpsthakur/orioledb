@@ -1,0 +1,124 @@
+# Fork-only pre-validation for orioledb/orioledb#1069. NOT part of the PR.
+#
+# Lives only on validate/orioledb-1069-* branches of sankalpsthakur/orioledb: the fix
+# (fix/1069-skip-scan-null-rows, 3cfea4be) plus this one commit. Upstream check.yml runs on
+# Blacksmith runners and only for main pushes and pull requests, so this copies its check job
+# onto GitHub-hosted runners for PG 16, 17 and 18 (amd64, gcc, check type "normal": the -Werror
+# build, then ci/check.sh). On PG18, where skip scan exists, it then restores the pre-fix
+# src/tableam/index_scan.c from the base commit, rebuilds, and requires the regression suite to
+# fail in exactly the two new #1069 result hunks (forward c > 5, backward NULLS FIRST mirror).
+name: "fork orioledb #1069 validation"
+
+on:
+  push:
+    branches:
+      - 'validate/orioledb-1069-**'
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: "check (amd64, ${{ matrix.pg_version }}, gcc, normal)"
+    strategy:
+      fail-fast: false
+      matrix:
+        pg_version: [16, 17, 18]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      LLVM_VER: 18
+      CPU: amd64
+      CHECK_TYPE: normal
+      PG_VERSION: ${{ matrix.pg_version }}
+      COMPILER: gcc
+      # orioledb/orioledb main commit the fix branch was cut from
+      BASE_SHA: e8f8cbe45db2c672dbbea4902699c6a90738af7b
+    steps:
+      - name: Checkout extension code into workspace directory
+        uses: actions/checkout@v6
+        with:
+          path: orioledb
+          fetch-depth: 3
+
+      - name: Show the commits under test
+        run: git -C orioledb log -3 --format='%h %an %s'
+
+      - name: Get the required tag name
+        shell: bash
+        run: |
+          echo "PGTAG=$(grep '^${{ matrix.pg_version }}: ' orioledb/.pgtags | cut -d' ' -f2-)" >> $GITHUB_ENV
+
+      - name: Checkout PostgreSQL code into workspace directory
+        uses: actions/checkout@v6
+        with:
+          repository: orioledb/postgres
+          ref: ${{ env.PGTAG }}
+          path: postgresql
+
+      - name: Setup prerequisites
+        run: bash ./orioledb/ci/prerequisites.sh
+
+      - name: Build
+        run: bash ./orioledb/ci/build.sh
+
+      - name: Install post build prerequisites
+        run: bash ./orioledb/ci/post_build_prerequisites.sh
+
+      - name: Check (with the fix)
+        timeout-minutes: 120
+        run: bash ./orioledb/ci/check.sh
+
+      - name: Check output
+        if: ${{ success() || failure() }}
+        run: bash ./orioledb/ci/check_output.sh
+
+      - name: Upload tests diffs
+        uses: actions/upload-artifact@v7
+        if: ${{ failure() }}
+        with:
+          name: ${{ matrix.pg_version }}_amd64_gcc_normal_test.diffs
+          path: |
+            ./orioledb/test/**/regression.diffs
+            ./orioledb/test/**/isolation_filtered.diffs
+          retention-days: 3
+          if-no-files-found: ignore
+
+      # Fail-before: the new cases must catch the bug on the unfixed code.
+      - name: Restore the pre-fix index_scan.c and rebuild (PG18)
+        if: ${{ matrix.pg_version == 18 }}
+        run: |
+          export PATH="$GITHUB_WORKSPACE/pgsql/bin:$PATH"
+          cd orioledb
+          git fetch --no-tags --depth=1 https://github.com/orioledb/orioledb.git "$BASE_SHA"
+          git checkout "$BASE_SHA" -- src/tableam/index_scan.c
+          git status --short
+          if grep -n 'skip_array_has_null_elem' src/tableam/index_scan.c; then
+            echo "the pre-fix index_scan.c was not restored"; exit 1
+          fi
+          make -j $(nproc) USE_PGXS=1 IS_DEV=1 CFLAGS_SL="$(pg_config --cflags_sl) -Werror -coverage -fprofile-update=atomic"
+          make -j $(nproc) USE_PGXS=1 IS_DEV=1 install
+
+      - name: Regression suite without the fix must fail in exactly the two new #1069 hunks (PG18)
+        if: ${{ matrix.pg_version == 18 }}
+        run: |
+          export PATH="$GITHUB_WORKSPACE/pgsql/bin:$PATH"
+          cd orioledb
+          find test -name regression.diffs -delete
+          set +e
+          make USE_PGXS=1 IS_DEV=1 regresscheck -j $(nproc) > ../regress_prefix.log 2>&1
+          rc=$?
+          set -e
+          grep -E '^(not ok|ok) |^# ' ../regress_prefix.log | grep -vE '^ok ' | head -40
+          [ "$rc" -ne 0 ] || { echo "pre-fix regresscheck passed: the new cases do not catch the bug"; exit 1; }
+          diffs=$(find test -name regression.diffs | head -1)
+          [ -n "$diffs" ] || { echo "no regression.diffs found"; tail -60 ../regress_prefix.log; exit 1; }
+          cat "$diffs"
+          failed=$(grep -cE '^not ok ' ../regress_prefix.log || true)
+          hunks=$(grep -c '^@@' "$diffs" || true)
+          want=$(grep -c '^-   197 | 22086$' "$diffs" || true)
+          got=$(grep -c '^+   196 | 21085$' "$diffs" || true)
+          echo "failed tests: $failed, hunks: $hunks, expected-197 lines: $want, actual-196 lines: $got"
+          grep -E '^not ok ' ../regress_prefix.log | grep -q ' indices ' || { echo "the indices test did not fail"; exit 1; }
+          [ "$failed" = 1 ] && [ "$hunks" = 2 ] && [ "$want" = 2 ] && [ "$got" = 2 ] || { echo "unexpected pre-fix failure shape"; exit 1; }
+          echo "OK: without the fix exactly the two new #1069 hunks fail"

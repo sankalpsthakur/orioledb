@@ -9173,6 +9173,33 @@ SELECT count(*), sum(c) FROM o_test_skip_probe
     14 | 1393
 (1 row)
 
+-- NULLs in the leading skipped column that sort first in the scan: the
+-- probe lands on them before any value of that column is pinned.  Give
+-- the NULL group a few more values of the next column.
+INSERT INTO o_test_skip_probe VALUES (NULL, 5, 1003), (NULL, 5, 1004),
+	(NULL, 0, 1005);
+-- backward: the index stores the NULLs last, so the scan meets them first
+SELECT count(*), sum(c) FROM
+	(SELECT c FROM o_test_skip_probe WHERE c > 5
+	 ORDER BY a DESC, b DESC, c DESC) s;
+ count |  sum  
+-------+-------
+   200 | 25098
+(1 row)
+
+-- forward over an index that stores them first
+CREATE INDEX o_test_skip_probe_nf_idx
+	ON o_test_skip_probe (a NULLS FIRST, b NULLS FIRST, c);
+SELECT count(*), sum(c) FROM
+	(SELECT c FROM o_test_skip_probe WHERE c > 5
+	 ORDER BY a NULLS FIRST, b NULLS FIRST, c) s;
+ count |  sum  
+-------+-------
+   200 | 25098
+(1 row)
+
+DROP INDEX o_test_skip_probe_nf_idx;
+DELETE FROM o_test_skip_probe WHERE c > 1001;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
 DROP TABLE o_test_skip_probe;

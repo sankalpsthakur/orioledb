@@ -2174,6 +2174,23 @@ SELECT count(*), sum(c) FROM o_test_skip_probe WHERE a IS NULL AND b = 3;
 -- range on the leading column with equality below it
 SELECT count(*), sum(c) FROM o_test_skip_probe
 	WHERE a BETWEEN 1 AND 2 AND b = 5;
+-- NULLs in the leading skipped column that sort first in the scan: the
+-- probe lands on them before any value of that column is pinned.  Give
+-- the NULL group a few more values of the next column.
+INSERT INTO o_test_skip_probe VALUES (NULL, 5, 1003), (NULL, 5, 1004),
+	(NULL, 0, 1005);
+-- backward: the index stores the NULLs last, so the scan meets them first
+SELECT count(*), sum(c) FROM
+	(SELECT c FROM o_test_skip_probe WHERE c > 5
+	 ORDER BY a DESC, b DESC, c DESC) s;
+-- forward over an index that stores them first
+CREATE INDEX o_test_skip_probe_nf_idx
+	ON o_test_skip_probe (a NULLS FIRST, b NULLS FIRST, c);
+SELECT count(*), sum(c) FROM
+	(SELECT c FROM o_test_skip_probe WHERE c > 5
+	 ORDER BY a NULLS FIRST, b NULLS FIRST, c) s;
+DROP INDEX o_test_skip_probe_nf_idx;
+DELETE FROM o_test_skip_probe WHERE c > 1001;
 
 RESET enable_seqscan;
 RESET enable_bitmapscan;

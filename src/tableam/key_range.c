@@ -114,6 +114,9 @@ o_key_data_to_key_range(OBTreeKeyRange *res, ScanKeyData *keyData,
 {
 	int			i;
 	bool		exact = true;
+#if PG_VERSION_NUM >= 180000
+	bool		skipArrayOpen = false;
+#endif
 
 	res->empty = false;
 	res->low.nkeys = resultNKeys;
@@ -223,28 +226,46 @@ o_key_data_to_key_range(OBTreeKeyRange *res, ScanKeyData *keyData,
 			 */
 			if (key->sk_flags & SK_BT_SKIP)
 			{
-				bool		have_minval = (key->sk_flags & SK_BT_MINVAL) != 0;
-				bool		have_maxval = (key->sk_flags & SK_BT_MAXVAL) != 0;
 				bool		have_next = (key->sk_flags & SK_BT_NEXT) != 0;
 				bool		have_prior = (key->sk_flags & SK_BT_PRIOR) != 0;
 				bool		have_isnull = (key->sk_flags & SK_ISNULL) != 0;
-				bool		sentinel = have_minval || have_maxval || have_isnull;
+				bool		at_element = !have_next && !have_prior &&
+					!(key->sk_flags & (SK_BT_MINVAL | SK_BT_MAXVAL));
 
 				Assert(arrayKeys->num_elems == -1);
 
 				/*
-				 * Post-advancement state: SkipSupport produced a concrete
-				 * next leading value (no MINVAL/MAXVAL, no NEXT/PRIOR, no
-				 * ISNULL).  Pin both bounds to sk_argument so the iterator
-				 * visits only the tuples for this distinct value.
+				 * The array stands at an element: a value pinned from a
+				 * tuple, or NULL, which is an element of an array with
+				 * null_elem (its first one where NULLs sort first in the scan
+				 * direction, see _bt_array_set_low_or_high()).  Pin both
+				 * bounds to it so the iterator visits only the tuples of this
+				 * distinct value.
+				 *
+				 * That holds only while every earlier skip array stands at an
+				 * element too.  Behind an open array this one says nothing
+				 * about where the scan is: it takes the value of the first
+				 * tuple the open array's probe finds, as in
+				 * _bt_advance_array_keys(), and until then contributes only
+				 * its quals below.  Its initial NULL element would otherwise
+				 * narrow the probe to the earlier column's values that have a
+				 * NULL in this one.
 				 */
-				if (!sentinel && !have_next && !have_prior)
+				if (at_element && !skipArrayOpen)
 				{
-					low.flags = O_VALUE_BOUND_LOWER | O_VALUE_BOUND_INCLUSIVE;
-					high.flags = O_VALUE_BOUND_UPPER | O_VALUE_BOUND_INCLUSIVE;
-					o_fill_key_bounds(key->sk_argument,
-									  OidIsValid(key->sk_subtype) ? key->sk_subtype : field->inputtype,
-									  &low, &high, field, datoid);
+					if (have_isnull)
+					{
+						/* the SK_SEARCHNULL case above set the NULL point */
+						Assert(key->sk_flags & SK_SEARCHNULL);
+					}
+					else
+					{
+						low.flags = O_VALUE_BOUND_LOWER | O_VALUE_BOUND_INCLUSIVE;
+						high.flags = O_VALUE_BOUND_UPPER | O_VALUE_BOUND_INCLUSIVE;
+						o_fill_key_bounds(key->sk_argument,
+										  OidIsValid(key->sk_subtype) ? key->sk_subtype : field->inputtype,
+										  &low, &high, field, datoid);
+					}
 					res->low.keys[attnum] = low;
 					res->high.keys[attnum] = high;
 					arrayKeys++;
@@ -252,27 +273,27 @@ o_key_data_to_key_range(OBTreeKeyRange *res, ScanKeyData *keyData,
 				}
 
 				/*
-				 * Sentinel (MINVAL/MAXVAL/SearchNull-initial) or NEXT/PRIOR
-				 * transition.  Use the global low_compare/high_compare
-				 * bounds, lifting them past sk_argument when NEXT/PRIOR
-				 * signals an exclusive advance from the just-visited value.
-				 *
-				 * Note: SK_ISNULL appears here as a *sentinel* state too --
-				 * _bt_start_array_keys uses it when the direction-appropriate
-				 * sentinel of a skip array with null_elem=true falls on the
-				 * NULL band of the leading column (e.g. backward scan +
-				 * nulls-last). Without tuple-aware advancement OrioleDB can't
-				 * tell that apart from a real NULL position, so we keep the
-				 * same broad bound behavior the pre-skip-scan path used --
-				 * the trailing-column predicate inside is_tuple_valid() then
-				 * filters the actual rows.
+				 * The array is open: at the MINVAL/MAXVAL sentinel, before
+				 * the scan has seen a value of the column, or stepping past
+				 * its element with NEXT/PRIOR.  The range is then a probe
+				 * over the column.  It starts just past the element (past the
+				 * NULL group when the element is NULL, which the scan only
+				 * steps past where NULLs sort first) and is otherwise bounded
+				 * by the array's quals, low_compare and high_compare.  The
+				 * first tuple found pins the element.  Every later skip array
+				 * is open too, see above.
 				 */
-				if (have_next)
+				if (!skipArrayOpen && have_next)
 				{
-					low.flags = O_VALUE_BOUND_LOWER;	/* exclusive */
-					o_fill_key_bounds(key->sk_argument,
-									  OidIsValid(key->sk_subtype) ? key->sk_subtype : field->inputtype,
-									  &low, NULL, field, datoid);
+					if (have_isnull)
+						low.flags = O_VALUE_BOUND_LOWER | O_VALUE_BOUND_NULL;
+					else
+					{
+						low.flags = O_VALUE_BOUND_LOWER;	/* exclusive */
+						o_fill_key_bounds(key->sk_argument,
+										  OidIsValid(key->sk_subtype) ? key->sk_subtype : field->inputtype,
+										  &low, NULL, field, datoid);
+					}
 					res->low.keys[attnum] = low;
 				}
 				else if (arrayKeys->low_compare)
@@ -300,12 +321,17 @@ o_key_data_to_key_range(OBTreeKeyRange *res, ScanKeyData *keyData,
 						O_VALUE_BOUND_LOWER | O_VALUE_BOUND_NULL;
 				}
 
-				if (have_prior)
+				if (!skipArrayOpen && have_prior)
 				{
-					high.flags = O_VALUE_BOUND_UPPER;	/* exclusive */
-					o_fill_key_bounds(key->sk_argument,
-									  OidIsValid(key->sk_subtype) ? key->sk_subtype : field->inputtype,
-									  NULL, &high, field, datoid);
+					if (have_isnull)
+						high.flags = O_VALUE_BOUND_UPPER | O_VALUE_BOUND_NULL;
+					else
+					{
+						high.flags = O_VALUE_BOUND_UPPER;	/* exclusive */
+						o_fill_key_bounds(key->sk_argument,
+										  OidIsValid(key->sk_subtype) ? key->sk_subtype : field->inputtype,
+										  NULL, &high, field, datoid);
+					}
 					res->high.keys[attnum] = high;
 				}
 				else if (arrayKeys->high_compare)
@@ -325,6 +351,7 @@ o_key_data_to_key_range(OBTreeKeyRange *res, ScanKeyData *keyData,
 					res->high.keys[attnum].flags =
 						O_VALUE_BOUND_UPPER | O_VALUE_BOUND_NULL;
 				}
+				skipArrayOpen = true;
 				arrayKeys++;
 				continue;
 			}

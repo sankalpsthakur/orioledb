@@ -1,0 +1,316 @@
+# Fork-only pre-validation for orioledb/orioledb#1313. NOT part of the PR.
+#
+# Lives only on validate/orioledb-1313-* branches of sankalpsthakur/orioledb: the fix
+# (fix/1313-leading-null-skip-scan) plus this one commit. Upstream check.yml runs on
+# Blacksmith runners and only for main pushes and pull requests, so this copies its check
+# job onto GitHub-hosted runners for PG 16, 17 and 18 (amd64, gcc, check type "normal":
+# the -Werror build, then ci/check.sh), and its pgindent job. On PG18, where skip scan
+# exists, the check job then restores the pre-fix sources from the base commit, rebuilds,
+# and requires the regression suite to fail in exactly the two new #1313 cases.
+#
+# The matrix job (PG18, cassert build) runs the targeted regression tests and the 260-case
+# differential matrix (.github/fork-1313/) three times: with the fix, without it, and with
+# the fix plus the #1069 fix from #1378, and requires that the fix makes no case wrong that
+# was right before.
+name: "fork orioledb #1313 validation"
+
+on:
+  push:
+    branches:
+      - 'validate/orioledb-1313-**'
+
+permissions:
+  contents: read
+
+env:
+  # orioledb/orioledb main commit the fix branch was cut from
+  BASE_SHA: d2e21feec51fb8a43d62aa7a05097564410dd89e
+  # the #1069 fix (PR #1378), on the fork
+  FIX_1069_SHA: 3cfea4be937598a3044ead513a1cd1ab056edadb
+
+jobs:
+  matrix:
+    name: "matrix (amd64, 18, gcc, debug)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      LLVM_VER: 18
+      CPU: amd64
+      CHECK_TYPE: debug
+      PG_VERSION: 18
+      COMPILER: gcc
+      PGPORT: 5444
+      PGDATABASE: m
+    steps:
+      - name: Checkout extension code into workspace directory
+        uses: actions/checkout@v6
+        with:
+          path: orioledb
+          fetch-depth: 3
+
+      - name: Show the commits under test
+        run: git -C orioledb log -3 --format='%h %an %s'
+
+      - name: Get the required tag name
+        shell: bash
+        run: |
+          echo "PGTAG=$(grep '^${{ env.PG_VERSION }}: ' orioledb/.pgtags | cut -d' ' -f2-)" >> $GITHUB_ENV
+
+      - name: Checkout PostgreSQL code into workspace directory
+        uses: actions/checkout@v6
+        with:
+          repository: orioledb/postgres
+          ref: ${{ env.PGTAG }}
+          path: postgresql
+
+      - name: Setup prerequisites
+        run: bash ./orioledb/ci/prerequisites.sh
+
+      - name: Build (cassert, with the fix)
+        run: bash ./orioledb/ci/build.sh
+
+      - name: Targeted regression tests with the fix
+        run: |
+          export PATH="$GITHUB_WORKSPACE/pgsql/bin:$PATH"
+          cd orioledb
+          make USE_PGXS=1 IS_DEV=1 regresscheck REGRESSCHECKS="indices iterator nulls native_si_scan parallel_scan explain primary_key include_pk opclass partial fastpath_desc index_bridging bitmap_scan subquery joins"
+
+      - name: Start a cluster for the matrix
+        run: |
+          export PATH="$GITHUB_WORKSPACE/pgsql/bin:$PATH"
+          initdb -N --encoding=UTF-8 --locale=C -D "$GITHUB_WORKSPACE/mdata"
+          cat orioledb/test/orioledb_regression.conf >> "$GITHUB_WORKSPACE/mdata/postgresql.conf"
+          echo "port = $PGPORT" >> "$GITHUB_WORKSPACE/mdata/postgresql.conf"
+          pg_ctl -D "$GITHUB_WORKSPACE/mdata" -l "$GITHUB_WORKSPACE/mdata.log" -w start
+          createdb "$PGDATABASE"
+          psql -c 'CREATE EXTENSION orioledb'
+
+      - name: Matrix with the fix
+        run: |
+          export PATH="$GITHUB_WORKSPACE/pgsql/bin:$PATH"
+          bash orioledb/.github/fork-1313/run_matrix.sh fix "$GITHUB_WORKSPACE/mres" --setup
+
+      - name: Rebuild without the fix (sources from the base commit)
+        run: |
+          export PATH="$GITHUB_WORKSPACE/pgsql/bin:$PATH"
+          cd orioledb
+          git fetch --no-tags --depth=1 https://github.com/orioledb/orioledb.git "$BASE_SHA"
+          git checkout "$BASE_SHA" -- src/tableam/index_scan.c src/tableam/key_range.c include/tableam/index_scan.h
+          git status --short
+          if grep -q 'skipArrayOpen' src/tableam/key_range.c; then
+            echo "the pre-fix key_range.c was not restored"; exit 1
+          fi
+          pg_ctl -D "$GITHUB_WORKSPACE/mdata" -w stop
+          make -j $(nproc) USE_PGXS=1 IS_DEV=1 CFLAGS_SL="$(pg_config --cflags_sl) -Werror -coverage -fprofile-update=atomic"
+          make -j $(nproc) USE_PGXS=1 IS_DEV=1 install
+          pg_ctl -D "$GITHUB_WORKSPACE/mdata" -l "$GITHUB_WORKSPACE/mdata.log" -w start
+
+      - name: Fail-before, the new indices cases must fail without the fix
+        run: |
+          export PATH="$GITHUB_WORKSPACE/pgsql/bin:$PATH"
+          cd orioledb
+          find test -name regression.diffs -delete
+          set +e
+          make USE_PGXS=1 IS_DEV=1 regresscheck REGRESSCHECKS="indices" > ../regress_prefix.log 2>&1
+          rc=$?
+          set -e
+          grep -E '^(not ok|ok) ' ../regress_prefix.log
+          [ "$rc" -ne 0 ] || { echo "pre-fix regresscheck passed: the new cases do not catch the bug"; exit 1; }
+          diffs=$(find test -name regression.diffs | head -1)
+          [ -n "$diffs" ] || { echo "no regression.diffs found"; tail -60 ../regress_prefix.log; exit 1; }
+          cat "$diffs"
+          hunks=$(grep -c '^@@' "$diffs" || true)
+          want=$(grep -c '^-   200 | 25098$' "$diffs" || true)
+          echo "hunks: $hunks, expected-200|25098 lines: $want"
+          [ "$hunks" = 2 ] && [ "$want" = 2 ] || { echo "unexpected pre-fix failure shape"; exit 1; }
+          echo "OK: without the fix exactly the two new #1313 cases fail"
+
+      - name: Matrix without the fix
+        run: |
+          export PATH="$GITHUB_WORKSPACE/pgsql/bin:$PATH"
+          bash orioledb/.github/fork-1313/run_matrix.sh base "$GITHUB_WORKSPACE/mres"
+
+      - name: Compare, the fix must make nothing wrong that was right before
+        run: bash orioledb/.github/fork-1313/compare_matrix.sh "$GITHUB_WORKSPACE/mres" base fix
+
+      - name: Rebuild with the fix plus the #1069 fix (#1378, source part only)
+        run: |
+          export PATH="$GITHUB_WORKSPACE/pgsql/bin:$PATH"
+          cd orioledb
+          git checkout HEAD -- src/tableam/index_scan.c src/tableam/key_range.c include/tableam/index_scan.h
+          git fetch --no-tags --depth=2 https://github.com/sankalpsthakur/orioledb.git "$FIX_1069_SHA"
+          git diff "$FIX_1069_SHA^" "$FIX_1069_SHA" -- src/tableam/index_scan.c | git apply --verbose
+          git status --short
+          grep -c 'skip_array_has_null_elem' src/tableam/index_scan.c
+          pg_ctl -D "$GITHUB_WORKSPACE/mdata" -w stop
+          make -j $(nproc) USE_PGXS=1 IS_DEV=1 CFLAGS_SL="$(pg_config --cflags_sl) -Werror -coverage -fprofile-update=atomic"
+          make -j $(nproc) USE_PGXS=1 IS_DEV=1 install
+          pg_ctl -D "$GITHUB_WORKSPACE/mdata" -l "$GITHUB_WORKSPACE/mdata.log" -w start
+
+      - name: Targeted regression tests with both fixes
+        run: |
+          export PATH="$GITHUB_WORKSPACE/pgsql/bin:$PATH"
+          cd orioledb
+          make USE_PGXS=1 IS_DEV=1 regresscheck REGRESSCHECKS="indices iterator nulls"
+
+      - name: Matrix with both fixes
+        run: |
+          export PATH="$GITHUB_WORKSPACE/pgsql/bin:$PATH"
+          bash orioledb/.github/fork-1313/run_matrix.sh both "$GITHUB_WORKSPACE/mres"
+
+      - name: Compare both fixes against this fix alone
+        run: bash orioledb/.github/fork-1313/compare_matrix.sh "$GITHUB_WORKSPACE/mres" fix both lenient
+
+      - name: Stop the cluster
+        if: ${{ always() }}
+        run: |
+          export PATH="$GITHUB_WORKSPACE/pgsql/bin:$PATH"
+          pg_ctl -D "$GITHUB_WORKSPACE/mdata" -w stop || true
+
+      - name: Upload matrix results
+        uses: actions/upload-artifact@v7
+        if: ${{ always() }}
+        with:
+          name: 1313_matrix_results
+          path: |
+            mres/**
+            mdata.log
+            regress_prefix.log
+            ./orioledb/test/**/regression.diffs
+          retention-days: 3
+          if-no-files-found: ignore
+
+  check:
+    name: "check (amd64, ${{ matrix.pg_version }}, gcc, normal)"
+    strategy:
+      fail-fast: false
+      matrix:
+        pg_version: [16, 17, 18]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      LLVM_VER: 18
+      CPU: amd64
+      CHECK_TYPE: normal
+      PG_VERSION: ${{ matrix.pg_version }}
+      COMPILER: gcc
+    steps:
+      - name: Checkout extension code into workspace directory
+        uses: actions/checkout@v6
+        with:
+          path: orioledb
+          fetch-depth: 3
+
+      - name: Show the commits under test
+        run: git -C orioledb log -3 --format='%h %an %s'
+
+      - name: Get the required tag name
+        shell: bash
+        run: |
+          echo "PGTAG=$(grep '^${{ matrix.pg_version }}: ' orioledb/.pgtags | cut -d' ' -f2-)" >> $GITHUB_ENV
+
+      - name: Checkout PostgreSQL code into workspace directory
+        uses: actions/checkout@v6
+        with:
+          repository: orioledb/postgres
+          ref: ${{ env.PGTAG }}
+          path: postgresql
+
+      - name: Setup prerequisites
+        run: bash ./orioledb/ci/prerequisites.sh
+
+      - name: Build
+        run: bash ./orioledb/ci/build.sh
+
+      - name: Install post build prerequisites
+        run: bash ./orioledb/ci/post_build_prerequisites.sh
+
+      - name: Check (with the fix)
+        timeout-minutes: 120
+        run: bash ./orioledb/ci/check.sh
+
+      - name: Check output
+        if: ${{ success() || failure() }}
+        run: bash ./orioledb/ci/check_output.sh
+
+      - name: Upload tests diffs
+        uses: actions/upload-artifact@v7
+        if: ${{ failure() }}
+        with:
+          name: ${{ matrix.pg_version }}_amd64_gcc_normal_test.diffs
+          path: |
+            ./orioledb/test/**/regression.diffs
+            ./orioledb/test/**/isolation_filtered.diffs
+          retention-days: 3
+          if-no-files-found: ignore
+
+      # Fail-before: the new cases must catch the bug on the unfixed code.
+      - name: Restore the pre-fix sources and rebuild (PG18)
+        if: ${{ matrix.pg_version == 18 }}
+        run: |
+          export PATH="$GITHUB_WORKSPACE/pgsql/bin:$PATH"
+          cd orioledb
+          git fetch --no-tags --depth=1 https://github.com/orioledb/orioledb.git "$BASE_SHA"
+          git checkout "$BASE_SHA" -- src/tableam/index_scan.c src/tableam/key_range.c include/tableam/index_scan.h
+          git status --short
+          if grep -q 'skipArrayOpen' src/tableam/key_range.c; then
+            echo "the pre-fix key_range.c was not restored"; exit 1
+          fi
+          make -j $(nproc) USE_PGXS=1 IS_DEV=1 CFLAGS_SL="$(pg_config --cflags_sl) -Werror -coverage -fprofile-update=atomic"
+          make -j $(nproc) USE_PGXS=1 IS_DEV=1 install
+
+      - name: Regression suite without the fix must fail in exactly the two new #1313 cases (PG18)
+        if: ${{ matrix.pg_version == 18 }}
+        run: |
+          export PATH="$GITHUB_WORKSPACE/pgsql/bin:$PATH"
+          cd orioledb
+          find test -name regression.diffs -delete
+          set +e
+          make USE_PGXS=1 IS_DEV=1 regresscheck -j $(nproc) > ../regress_prefix.log 2>&1
+          rc=$?
+          set -e
+          grep -E '^(not ok|ok) |^# ' ../regress_prefix.log | grep -vE '^ok ' | head -40
+          [ "$rc" -ne 0 ] || { echo "pre-fix regresscheck passed: the new cases do not catch the bug"; exit 1; }
+          diffs=$(find test -name regression.diffs | head -1)
+          [ -n "$diffs" ] || { echo "no regression.diffs found"; tail -60 ../regress_prefix.log; exit 1; }
+          cat "$diffs"
+          failed=$(grep -cE '^not ok ' ../regress_prefix.log || true)
+          hunks=$(grep -c '^@@' "$diffs" || true)
+          want=$(grep -c '^-   200 | 25098$' "$diffs" || true)
+          echo "failed tests: $failed, hunks: $hunks, expected-200|25098 lines: $want"
+          grep -E '^not ok ' ../regress_prefix.log | grep -q ' indices ' || { echo "the indices test did not fail"; exit 1; }
+          [ "$failed" = 1 ] && [ "$hunks" = 2 ] && [ "$want" = 2 ] || { echo "unexpected pre-fix failure shape"; exit 1; }
+          echo "OK: without the fix exactly the two new #1313 cases fail"
+
+  pgindent:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      LLVM_VER: 18
+      CPU: amd64
+      CHECK_TYPE: pgindent
+      PG_VERSION: 18
+      COMPILER: gcc
+    steps:
+      - name: Checkout extension code into workspace directory
+        uses: actions/checkout@v6
+        with:
+          path: orioledb
+      - name: Get the required tag name
+        shell: bash
+        run: |
+          echo "PGTAG=$(grep '^${{ env.PG_VERSION }}: ' orioledb/.pgtags | cut -d' ' -f2-)" >> $GITHUB_ENV
+      - name: Checkout PostgreSQL code into workspace directory
+        uses: actions/checkout@v6
+        with:
+          repository: orioledb/postgres
+          ref: ${{ env.PGTAG }}
+          path: postgresql
+      - name: Setup prerequisites
+        run: bash ./orioledb/ci/prerequisites.sh
+      - name: Build
+        run: bash ./orioledb/ci/build.sh
+      - name: Install post build prerequisites
+        run: bash ./orioledb/ci/post_build_prerequisites.sh
+      - name: PGIndent
+        run: bash ./orioledb/ci/pgindent.sh
